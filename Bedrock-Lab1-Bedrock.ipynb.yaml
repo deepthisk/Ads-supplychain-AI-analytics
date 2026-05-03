@@ -1,0 +1,17 @@
+tables:
+	-name: impression_logs
+	description: Raw auction data containing bids and wins
+	athena_database: your_database_name
+	columns:
+		-name: eligible_imp_cnt
+		 description: count of impressions eligible for auction
+		 -name: filled_imp_cnt
+		  description: count of impressions successfully filled
+		 -name: dsp_id
+		  description: unique identifier for the Demand side platform
+
+metrics:
+	-name: fill_rate
+	 description: Ratio of filled impressions to eligible impressions
+	 formula: "sum(filled_imp_cnt)/nullif(sum(eligible_imp_cnt),0)"
+	 dimensions: [dsp_id, publisher_id]

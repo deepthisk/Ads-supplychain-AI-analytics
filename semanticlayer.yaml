@@ -1,0 +1,691 @@
+# =============================================================================
+# SEMANTIC LAYER — Programmatic Ads Supply Chain
+# Purpose: Context for RAG / Vector DB / LLM-based analytics
+# Domain: Supply-side programmatic advertising (SSP / Ad Exchange perspective)
+# Last updated: 2026-04-29
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# DOMAIN CONTEXT
+# Used by LLM to understand the business domain before answering questions
+# -----------------------------------------------------------------------------
+domain:
+  name: Programmatic Advertising Supply Chain
+  description: >
+    This semantic layer describes the end-to-end programmatic advertising supply chain
+    from the supply side (SSP / Ad Exchange perspective). An ad request originates from
+    a publisher's website or app, travels through the SSP, gets evaluated, sent to DSPs
+    for bidding, and results in either a served impression or a drop at one of several
+    funnel stages.
+  funnel_stages:
+    - stage: Ad Request
+      description: Publisher sends an ad request to the SSP/Ad Exchange
+    - stage: Punt
+      description: >
+        SSP/Ad Exchange evaluates the request and decides NOT to send it to any DSP.
+        This is a supply-side decision. Reasons include timeouts, duplicate requests,
+        invalid requests, ad pod already full, or smart traffic shaping/throttling.
+    - stage: Bid Request
+      description: SSP sends the request to one or more DSPs for evaluation
+    - stage: DSP Evaluation
+      description: >
+        DSP internally filters candidates, ranks eligible ads, and picks the best
+        candidate to submit back to the exchange. If no eligible candidate exists,
+        DSP returns a no-bid response.
+    - stage: No-Bid
+      description: >
+        DSP received the bid request but chose not to respond with a bid.
+        Reasons include no matching ads, targeting mismatch, floor price too high,
+        budget exhausted, or DSP timeout (no response within the allowed window).
+    - stage: Bid Returned
+      description: DSP submits a bid back to the Ad Exchange for the auction
+    - stage: Auction
+      description: >
+        Ad Exchange runs the auction across all DSP bid responses.
+        The highest valid bid wins subject to floor price and deal rules.
+    - stage: Impression Served
+      description: Winning DSP's creative is delivered to the user on the publisher page
+
+# -----------------------------------------------------------------------------
+# TABLES
+# -----------------------------------------------------------------------------
+tables:
+
+  - name: bid_log
+    file: bid_log_v2.csv
+    description: >
+      Records every auction where at least one DSP submitted a bid back to the
+      Ad Exchange. Each row represents one auction with one winning or competing bid.
+      This is the primary table for auction-level analysis including pricing,
+      win rates, revenue, and performance metrics.
+    athena_database: programmatic_ads
+    s3_path: s3://githubdk/supply_chain/bid_log_v2.csv
+    grain: one row per auction (auction_id is unique)
+    columns:
+      - name: auction_id
+        type: string
+        description: Unique identifier for each auction. Primary key. Used to join across all log tables.
+      - name: impression_id
+        type: string
+        description: Unique identifier for the impression associated with this auction. Links to impression_log.
+      - name: timestamp
+        type: datetime
+        description: "Date and time when the auction occurred. Format YYYY-MM-DD HH:MM:SS."
+      - name: publisher_id
+        type: string
+        description: Unique identifier for the publisher (e.g. pub_001). Foreign key to publisher dimension.
+      - name: publisher_domain
+        type: string
+        description: Domain of the publisher website (e.g. nytimes.com, buzzfeed.com).
+      - name: publisher_name
+        type: string
+        description: Human-readable name of the publisher (e.g. The New York Times).
+      - name: publisher_tier
+        type: string
+        description: >
+          Quality tier of the publisher. Values: Premium, Mid-Market, Long-Tail.
+          Premium publishers command higher floor prices and attract more DSP demand.
+      - name: supply_source
+        type: string
+        description: >
+          Name of the supply package or audience pack the inventory belongs to
+          (e.g. Sports Fan Audience Pack, CTV Living Room Bundle).
+      - name: supply_source_type
+        type: string
+        description: >
+          Whether the supply source is first-party (1P) or third-party (3P) data.
+          1P = publisher's own data. 3P = third-party audience data.
+      - name: ssp
+        type: string
+        description: >
+          Name of the SSP (Supply Side Platform) handling this auction
+          (e.g. PubMatic, Magnite, OpenX, Index Exchange, TripleLift).
+      - name: ad_unit_type
+        type: string
+        description: >
+          Format of the ad unit. Values include: banner, video, native, display.
+          Video inventory is typically higher value. Native blends with content.
+      - name: deal_type
+        type: string
+        description: >
+          Type of programmatic deal. Values: open_auction (RTB), preferred_deal,
+          private_marketplace (PMP), programmatic_guaranteed.
+          Programmatic guaranteed has committed spend; open auction is fully competitive.
+      - name: deal_subtype
+        type: string
+        description: >
+          Technical mechanism for the deal. Values: header_bidding, server_side,
+          direct_tag. Header bidding allows multiple SSPs to compete simultaneously.
+      - name: deal_id
+        type: string
+        description: >
+          Unique identifier for a specific deal between publisher and advertiser/DSP.
+          Null for open auction inventory.
+      - name: device_type
+        type: string
+        description: "Type of device where the ad will be served. Values: desktop, mobile, tablet, ctv."
+      - name: os
+        type: string
+        description: Operating system of the device (e.g. iOS, Android, Windows, AppleTV).
+      - name: country
+        type: string
+        description: Two-letter ISO country code of the user (e.g. US, CA, UK).
+      - name: city
+        type: string
+        description: City of the user based on IP geolocation.
+      - name: age_band
+        type: string
+        description: Age range of the target audience (e.g. 18-24, 25-34, 35-44, 45-54, 55-64, 65+).
+      - name: gender
+        type: string
+        description: "Gender of the target audience. Values: M, F, Unknown."
+      - name: income_band
+        type: string
+        description: "Household income range of the target audience (e.g. $50K-$75K, $75K-$100K, $150K+)."
+      - name: advertiser
+        type: string
+        description: Name of the advertiser whose creative will be served if this auction is won.
+      - name: ad_category
+        type: string
+        description: IAB content category of the advertiser (e.g. Retail, Fashion, Auto, Finance).
+      - name: floor_price
+        type: float
+        description: >
+          Minimum CPM price set by the publisher below which no bid will win.
+          Expressed in USD per thousand impressions. High floor prices reduce fill rate.
+      - name: num_bidders
+        type: integer
+        description: Number of DSPs that submitted a bid in this auction.
+      - name: winning_bid
+        type: float
+        description: CPM value of the highest bid submitted in the auction. In USD.
+      - name: clearing_price
+        type: float
+        description: >
+          Final price paid by the winning DSP. In a second-price auction this is
+          the second highest bid + $0.01. In first-price it equals the winning bid.
+      - name: bid_floor_delta
+        type: float
+        description: Difference between winning bid and floor price (winning_bid minus floor_price). Positive means bid exceeded floor.
+      - name: bid_to_floor_ratio
+        type: float
+        description: Ratio of winning bid to floor price. Values > 1 mean bid exceeded floor. Used to assess floor price competitiveness.
+      - name: publisher_net_revenue
+        type: float
+        description: Revenue earned by the publisher after SSP fees. In USD CPM.
+      - name: ssp_fee
+        type: float
+        description: Fee charged by the SSP for facilitating the auction. In USD CPM.
+      - name: ssp_rev_share_pct
+        type: float
+        description: Percentage of gross revenue retained by the SSP as its fee.
+      - name: ecpm
+        type: float
+        description: >
+          Effective CPM — the actual revenue rate achieved. Calculated as
+          (publisher_net_revenue / impressions) * 1000. Key yield metric.
+      - name: auction_won
+        type: integer
+        description: Binary flag. 1 = auction was won and impression was served. 0 = auction lost.
+      - name: viewable
+        type: integer
+        description: Binary flag. 1 = impression was measured as viewable per MRC standards. 0 = not viewable.
+      - name: video_completed
+        type: integer
+        description: Binary flag. 1 = video ad was played to completion. 0 = not completed or not a video ad.
+      - name: click
+        type: integer
+        description: Binary flag. 1 = user clicked on the ad. 0 = no click.
+      - name: conversion
+        type: integer
+        description: Binary flag. 1 = user completed a conversion action post-click. 0 = no conversion.
+      - name: loss_reason
+        type: string
+        description: >
+          Reason the auction was lost if auction_won = 0. Examples: outbid, timeout,
+          creative rejection. Null if auction was won.
+      - name: time_to_serve_ms
+        type: float
+        description: Total latency in milliseconds from ad request to creative delivery. Lower is better. Industry standard is under 200ms.
+
+  - name: impression_log
+    file: impression_log_v2.csv
+    description: >
+      Records every successfully served impression — auctions that were won and
+      where the creative was delivered to the user. This is a subset of bid_log
+      where auction_won = 1. Used for revenue reporting, viewability analysis,
+      and post-auction performance metrics.
+    athena_database: programmatic_ads
+    s3_path: s3://githubdk/supply_chain/impression_log_v2.csv
+    grain: one row per served impression (impression_id is unique)
+    columns:
+      - name: impression_id
+        type: string
+        description: Unique identifier for the served impression. Primary key.
+      - name: auction_id
+        type: string
+        description: Auction that resulted in this impression. Foreign key to bid_log.
+      - name: timestamp
+        type: datetime
+        description: Date and time when the impression was served.
+      - name: publisher_id
+        type: string
+        description: Publisher where the impression was served.
+      - name: publisher_domain
+        type: string
+        description: Domain of the publisher where impression was served.
+      - name: publisher_name
+        type: string
+        description: Human-readable publisher name.
+      - name: publisher_tier
+        type: string
+        description: "Quality tier of the publisher. Values: Premium, Mid-Market, Long-Tail."
+      - name: supply_source
+        type: string
+        description: Supply package or audience pack this impression belongs to.
+      - name: supply_source_type
+        type: string
+        description: First-party (1P) or third-party (3P) supply source.
+      - name: ssp
+        type: string
+        description: SSP that facilitated this impression.
+      - name: ad_unit_type
+        type: string
+        description: "Ad format served. Values: banner, video, native, display."
+      - name: deal_type
+        type: string
+        description: "Deal type for this impression. Values: open_auction, preferred_deal, private_marketplace, programmatic_guaranteed."
+      - name: deal_subtype
+        type: string
+        description: "Technical mechanism. Values: header_bidding, server_side, direct_tag."
+      - name: deal_id
+        type: string
+        description: Deal identifier. Null for open auction.
+      - name: device_type
+        type: string
+        description: "Device type where impression was served. Values: desktop, mobile, tablet, ctv."
+      - name: os
+        type: string
+        description: Operating system of the device.
+      - name: country
+        type: string
+        description: Country of the user.
+      - name: city
+        type: string
+        description: City of the user.
+      - name: age_band
+        type: string
+        description: Age range of the audience.
+      - name: gender
+        type: string
+        description: Gender of the audience.
+      - name: income_band
+        type: string
+        description: Household income range of the audience.
+      - name: advertiser
+        type: string
+        description: Advertiser whose creative was served.
+      - name: ad_category
+        type: string
+        description: IAB content category of the advertiser.
+      - name: floor_price
+        type: float
+        description: Publisher floor price for this impression in USD CPM.
+      - name: num_bidders
+        type: integer
+        description: Number of DSPs that bid in the auction that produced this impression.
+      - name: winning_bid
+        type: float
+        description: Winning bid CPM in USD.
+      - name: clearing_price
+        type: float
+        description: Final price paid by the winning DSP in USD CPM.
+      - name: ssp_fee
+        type: float
+        description: SSP fee for this impression in USD CPM.
+      - name: ecpm
+        type: float
+        description: Effective CPM achieved for this impression in USD.
+      - name: publisher_net_revenue
+        type: float
+        description: Net revenue to publisher after SSP fees in USD CPM.
+      - name: viewable
+        type: integer
+        description: Binary flag. 1 = impression was viewable per MRC standards.
+      - name: video_completed
+        type: integer
+        description: Binary flag. 1 = video completed. Only relevant for video ad units.
+      - name: click
+        type: integer
+        description: Binary flag. 1 = user clicked the ad.
+      - name: conversion
+        type: integer
+        description: Binary flag. 1 = user converted post-click.
+      - name: time_to_serve_ms
+        type: integer
+        description: Latency from request to creative delivery in milliseconds.
+      - name: auction_won
+        type: integer
+        description: Always 1 in this table — all rows are won auctions.
+
+  - name: no_bid_log
+    file: no_bid_log_v2.csv
+    description: >
+      Records every auction where the SSP sent a bid request to DSPs but received
+      no valid bid in return. Each row represents a failed demand event — the DSP
+      evaluated the request internally (filtered candidates, ranked, selected) but
+      found no eligible ad to submit. Understanding no-bid reasons is critical for
+      diagnosing demand gaps and pricing misalignment.
+    athena_database: programmatic_ads
+    s3_path: s3://githubdk/supply_chain/no_bid_log_v2.csv
+    grain: one row per no-bid auction (auction_id is unique)
+    columns:
+      - name: auction_id
+        type: string
+        description: Unique identifier for the auction. Foreign key to bid_log and punt_log.
+      - name: timestamp
+        type: datetime
+        description: Date and time of the no-bid event.
+      - name: publisher_id
+        type: string
+        description: Publisher whose inventory was not filled.
+      - name: publisher_domain
+        type: string
+        description: Domain of the publisher.
+      - name: publisher_name
+        type: string
+        description: Human-readable publisher name.
+      - name: publisher_tier
+        type: string
+        description: Quality tier of the publisher.
+      - name: supply_source
+        type: string
+        description: Supply package this inventory belongs to.
+      - name: supply_source_type
+        type: string
+        description: First-party (1P) or third-party (3P) supply source.
+      - name: ssp
+        type: string
+        description: SSP that sent the bid request.
+      - name: ad_unit_type
+        type: string
+        description: Ad format that was not filled.
+      - name: deal_type
+        type: string
+        description: Deal type for this unfilled auction.
+      - name: deal_subtype
+        type: string
+        description: Technical mechanism for the deal.
+      - name: deal_id
+        type: string
+        description: Deal identifier if applicable.
+      - name: device_type
+        type: string
+        description: Device type for this unfilled request.
+      - name: os
+        type: string
+        description: Operating system of the device.
+      - name: country
+        type: string
+        description: Country of the user.
+      - name: city
+        type: string
+        description: City of the user.
+      - name: age_band
+        type: string
+        description: Age range of the audience.
+      - name: gender
+        type: string
+        description: Gender of the audience.
+      - name: income_band
+        type: string
+        description: Household income range of the audience.
+      - name: advertiser
+        type: string
+        description: Intended advertiser category for this inventory.
+      - name: ad_category
+        type: string
+        description: IAB content category.
+      - name: floor_price
+        type: float
+        description: Publisher floor price that DSPs had to beat. High floor prices are a leading cause of no-bids.
+      - name: num_bidders
+        type: integer
+        description: Number of DSPs that were contacted for this auction.
+      - name: num_dsps_contacted
+        type: integer
+        description: Total number of DSPs the SSP sent the bid request to.
+      - name: no_bid_reason
+        type: string
+        description: >
+          Reason the DSP did not return a bid. Critical field for demand diagnostics.
+          Values:
+            DSP_NO_RESPONSE — DSP received request but did not respond within the timeout window. Latency issue.
+            FLOOR_TOO_HIGH — Publisher floor price exceeded what DSP was willing to pay. Pricing misalignment.
+            NO_MATCHING_ADS — DSP has no active campaign matching this inventory format or placement. Format/inventory gap.
+            TARGETING_MISMATCH — DSP has campaigns but none match the audience, geography, or context of this request. Audience gap.
+            BUDGET_EXHAUSTED — DSP has spent its daily or campaign budget. Timing/pacing issue.
+      - name: suggested_bid_price
+        type: float
+        description: >
+          Price the DSP suggests the publisher should set as floor to receive bids.
+          Useful for floor price optimization. Only populated for FLOOR_TOO_HIGH reason.
+
+  - name: punt_log
+    file: punt_log_v2.csv
+    description: >
+      Records every ad request that the SSP/Ad Exchange decided NOT to send to any DSP.
+      This is a pure supply-side decision made before any DSP is contacted.
+      Punts represent lost monetization opportunities that never entered the auction.
+      Understanding punt reasons helps diagnose SSP infrastructure issues, inventory
+      quality problems, and traffic shaping behavior.
+    athena_database: programmatic_ads
+    s3_path: s3://githubdk/supply_chain/punt_log_v2.csv
+    grain: one row per punted request (auction_id is unique)
+    columns:
+      - name: auction_id
+        type: string
+        description: Unique identifier for the punted request.
+      - name: timestamp
+        type: datetime
+        description: Date and time when the punt decision was made.
+      - name: publisher_id
+        type: string
+        description: Publisher whose request was punted.
+      - name: publisher_domain
+        type: string
+        description: Domain of the publisher.
+      - name: publisher_name
+        type: string
+        description: Human-readable publisher name.
+      - name: publisher_tier
+        type: string
+        description: Quality tier of the publisher.
+      - name: supply_source
+        type: string
+        description: Supply package this inventory belongs to.
+      - name: supply_source_type
+        type: string
+        description: First-party (1P) or third-party (3P) supply source.
+      - name: ssp
+        type: string
+        description: SSP that made the punt decision.
+      - name: ad_unit_type
+        type: string
+        description: Ad format of the punted request.
+      - name: deal_type
+        type: string
+        description: Deal type for this punted request.
+      - name: deal_subtype
+        type: string
+        description: Technical mechanism for the deal.
+      - name: deal_id
+        type: string
+        description: Deal identifier if applicable.
+      - name: device_type
+        type: string
+        description: Device type for this punted request.
+      - name: os
+        type: string
+        description: Operating system of the device.
+      - name: country
+        type: string
+        description: Country of the user.
+      - name: city
+        type: string
+        description: City of the user.
+      - name: age_band
+        type: string
+        description: Age range of the audience.
+      - name: gender
+        type: string
+        description: Gender of the audience.
+      - name: income_band
+        type: string
+        description: Household income range of the audience.
+      - name: advertiser
+        type: string
+        description: Intended advertiser category.
+      - name: ad_category
+        type: string
+        description: IAB content category.
+      - name: floor_price
+        type: float
+        description: Publisher floor price at time of punt.
+      - name: num_dsps_contacted
+        type: integer
+        description: Always 0 for punt log — no DSPs were contacted.
+      - name: punt_reason
+        type: string
+        description: >
+          Reason the SSP decided not to send the request to DSPs. Critical field for
+          supply-side infrastructure diagnostics.
+          Values:
+            TIMEOUT — SSP took too long to process the request and killed it. Infrastructure/latency issue.
+            AD_POD_FULL — The video ad break (pod) already has the maximum number of ads filled. No slot available. Video-specific.
+            PACING_THROTTLE — SSP applied smart traffic shaping, deliberately throttling requests to manage delivery rate or protect auction quality. Possibly acting on DSP pacing signals.
+            DUPLICATE_REQUEST — Same request was received more than once. Publisher or upstream system sending duplicate signals. Data quality issue.
+            INVALID_REQUEST — Request was malformed, missing required fields, or failed validation. Publisher integration issue.
+
+# -----------------------------------------------------------------------------
+# RELATIONSHIPS
+# How tables join together for funnel analysis
+# -----------------------------------------------------------------------------
+relationships:
+  - name: bid_to_impression
+    description: >
+      bid_log joins to impression_log on auction_id = auction_id.
+      Not all bids result in impressions — only winning auctions (auction_won = 1).
+    left_table: bid_log
+    right_table: impression_log
+    join_key: auction_id
+    join_type: left
+    cardinality: one-to-one
+
+  - name: funnel_union
+    description: >
+      The complete supply chain funnel is constructed by combining all four logs.
+      Total ad requests = bid_log + no_bid_log + punt_log (by unique auction_id).
+      punt_log represents requests that never reached DSPs.
+      no_bid_log represents requests that reached DSPs but got no bid.
+      bid_log represents requests where at least one DSP bid.
+      impression_log is a subset of bid_log where auction_won = 1.
+    tables: [bid_log, no_bid_log, punt_log, impression_log]
+    common_key: auction_id
+
+# -----------------------------------------------------------------------------
+# METRICS
+# Pre-defined business metrics for LLM to use when answering questions
+# -----------------------------------------------------------------------------
+metrics:
+
+  - name: fill_rate
+    description: >
+      Percentage of total ad requests that resulted in a served impression.
+      The primary supply chain health metric. Low fill rate indicates demand gaps,
+      pricing misalignment, or infrastructure issues.
+    formula: "count(impression_log.impression_id) / (count(bid_log.auction_id) + count(no_bid_log.auction_id) + count(punt_log.auction_id))"
+    unit: percentage
+    good_direction: higher_is_better
+    benchmark: "Industry average 50-70% for premium inventory"
+    dimensions: [publisher_name, publisher_tier, deal_type, ad_unit_type, device_type, country, ssp]
+
+  - name: punt_rate
+    description: >
+      Percentage of total ad requests that were punted by the SSP before reaching any DSP.
+      High punt rate indicates SSP infrastructure problems, traffic quality issues,
+      or aggressive traffic shaping.
+    formula: "count(punt_log.auction_id) / (count(bid_log.auction_id) + count(no_bid_log.auction_id) + count(punt_log.auction_id))"
+    unit: percentage
+    good_direction: lower_is_better
+    benchmark: "Should be below 7% for healthy supply"
+    dimensions: [publisher_name, punt_reason, ad_unit_type, ssp, deal_type]
+
+  - name: no_bid_rate
+    description: >
+      Percentage of auctions sent to DSPs that received no bid in return.
+      High no-bid rate indicates demand gaps — DSPs are not interested in this inventory
+      due to pricing, targeting, format, or budget constraints.
+    formula: "count(no_bid_log.auction_id) / (count(bid_log.auction_id) + count(no_bid_log.auction_id))"
+    unit: percentage
+    good_direction: lower_is_better
+    benchmark: "Should be below 15% for healthy demand"
+    dimensions: [publisher_name, no_bid_reason, floor_price, ad_unit_type, deal_type, device_type]
+
+  - name: bid_win_rate
+    description: >
+      Percentage of auctions where a bid was received that resulted in a won impression.
+      Low win rate after bidding indicates auction competitiveness issues or creative
+      delivery failures.
+    formula: "count(impression_log.impression_id) / count(bid_log.auction_id)"
+    unit: percentage
+    good_direction: higher_is_better
+    dimensions: [publisher_name, deal_type, ad_unit_type, ssp]
+
+  - name: ecpm
+    description: >
+      Effective CPM — average revenue per thousand impressions served.
+      Key yield metric for publishers. Higher eCPM = better monetization.
+    formula: "avg(bid_log.ecpm)"
+    unit: USD per thousand impressions
+    good_direction: higher_is_better
+    dimensions: [publisher_name, publisher_tier, deal_type, ad_unit_type, device_type, country]
+
+  - name: viewability_rate
+    description: >
+      Percentage of served impressions that were measured as viewable per MRC standards
+      (50% of pixels in view for 1 second for display, 2 seconds for video).
+      Higher viewability commands premium CPMs from advertisers.
+    formula: "sum(impression_log.viewable) / count(impression_log.impression_id)"
+    unit: percentage
+    good_direction: higher_is_better
+    benchmark: "MRC standard minimum 70% for premium inventory"
+    dimensions: [publisher_name, ad_unit_type, device_type, deal_type]
+
+  - name: video_completion_rate
+    description: >
+      Percentage of video impressions where the ad was played to completion.
+      Key metric for video inventory quality. Higher completion rate = more valuable inventory.
+    formula: "sum(impression_log.video_completed) / count(impression_log.impression_id where ad_unit_type = 'video')"
+    unit: percentage
+    good_direction: higher_is_better
+    benchmark: "Industry average 70-80% for in-stream video"
+    dimensions: [publisher_name, device_type, deal_type, ad_unit_type]
+
+  - name: click_through_rate
+    description: >
+      Percentage of served impressions that received a user click.
+      Demand-side performance metric. Higher CTR = more valuable audience for advertisers.
+    formula: "sum(impression_log.click) / count(impression_log.impression_id)"
+    unit: percentage
+    good_direction: higher_is_better
+    dimensions: [publisher_name, ad_unit_type, device_type, ad_category, country]
+
+  - name: avg_floor_price
+    description: >
+      Average publisher floor price across auctions. Used to assess pricing strategy.
+      Compare against winning bids and no-bid reasons to optimize floor prices.
+    formula: "avg(bid_log.floor_price)"
+    unit: USD CPM
+    dimensions: [publisher_name, publisher_tier, deal_type, ad_unit_type]
+
+  - name: avg_time_to_serve
+    description: >
+      Average latency from ad request to creative delivery in milliseconds.
+      Critical infrastructure metric. High latency causes timeouts and lost impressions.
+    formula: "avg(bid_log.time_to_serve_ms)"
+    unit: milliseconds
+    good_direction: lower_is_better
+    benchmark: "Industry standard under 200ms. Above 300ms causes significant timeout losses."
+    dimensions: [publisher_name, ssp, device_type, ad_unit_type]
+
+# -----------------------------------------------------------------------------
+# FUNNEL SUMMARY
+# Pre-computed reference for LLM context
+# -----------------------------------------------------------------------------
+funnel_reference:
+  description: >
+    Reference funnel computed from sample data (bid_log_v2, impression_log_v2,
+    no_bid_log_v2, punt_log_v2). Use this as baseline for anomaly detection
+    and trend analysis.
+  stages:
+    - stage: Total Ad Requests
+      count: 73000
+      pct_of_total: 100.0
+    - stage: Punted by SSP
+      count: 8000
+      pct_of_total: 11.0
+      top_reason: TIMEOUT (35.7%)
+    - stage: Bid Requests sent to DSPs
+      count: 65000
+      pct_of_total: 89.0
+    - stage: No-Bid from DSPs
+      count: 15000
+      pct_of_total: 20.5
+      top_reason: DSP_NO_RESPONSE (30.1%)
+    - stage: Bids returned to Exchange
+      count: 50000
+      pct_of_total: 68.5
+    - stage: Impressions Served
+      count: 33960
+      pct_of_total: 46.5
